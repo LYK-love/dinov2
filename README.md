@@ -1,5 +1,33 @@
 :new: [2023-10-26] *Added DINOv2 backbones with registers, following [Vision Transformers Need Registers](https://arxiv.org/abs/2309.16588).*
 
+
+```sh
+conda create --name dinov2 python=3.9 --yes
+pip install -r requirements.txt 
+pip install -r requirements-extras.txt 
+
+# See https://github.com/open-mmlab/mmcv?tab=readme-ov-file#installation
+pip install -U openmim
+mim install mmcv
+```
+
+To download ckpts:
+```python
+import torch
+
+# DINOv2
+dinov2_vits14_lc = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_lc')
+dinov2_vitb14_lc = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_lc')
+dinov2_vitl14_lc = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_lc')
+dinov2_vitg14_lc = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitg14_lc')
+
+# DINOv2 with registers
+dinov2_vits14_reg_lc = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg_lc')
+dinov2_vitb14_reg_lc = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg_lc')
+dinov2_vitl14_reg_lc = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg_lc')
+dinov2_vitg14_reg_lc = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitg14_reg_lc')
+```
+
 # DINOv2: Learning Robust Visual Features without Supervision
 
 **[Meta AI Research, FAIR](https://ai.facebook.com/research/)**
