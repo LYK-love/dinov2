@@ -1,58 +1,90 @@
 import sys
 import os
+import math
 import torch
 import cv2
-import torchvision.transforms as tt
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import minmax_scale
 import matplotlib.pyplot as plt
 import numpy as np
+import torch.nn as nn
+
+import torchvision.transforms as T
+from PIL import Image
+
+import cv2
+import torch
+import torchvision.transforms as T
+from PIL import Image
 
 
 import cv2
-import numpy as np
 import torch
-import torchvision.transforms as tt
+import torchvision.transforms as T
+from PIL import Image
 
-def load_preprocess_video(video_path, target_size=448, device='cuda'):
+
+def load_preprocess_video(video_path, target_size=None, patch_size=14, device='cuda'):
     """
-    Loads a video, resizes frames to target_size, and normalizes.
+    Loads a video, resizes frames to target_size (if provided), makes them divisible by patch_size, 
+    and returns both unnormalized and normalized tensors, along with the video FPS and duration.
 
     Args:
     - video_path (str): Path to the input video.
-    - target_size (int): Final resize dimension (default 448).
+    - target_size (int or None): Final resize dimension (e.g., 224 or 448 in the paper). If None, no resizing is applied.
+    - patch_size (int): Patch size to make the frames divisible by.
     - device (str): Device to load the tensor onto.
 
     Returns:
-    - torch.Tensor: Video tensor of shape (B, C, target_size, target_size) before preprocess
-    - torch.Tensor: Preprocessed video tensor of shape (B, C, target_size, target_size).
+    - torch.Tensor: Unnormalized video tensor (B, C, H, W).
+    - torch.Tensor: Normalized video tensor (B, C, H, W).
+    - float: Frames per second (FPS) of the video.
     """
     cap = cv2.VideoCapture(video_path)
+
+    # Get FPS and total frame count
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+
+    # Calculate duration
+    duration = total_frames / fps if fps > 0 else 0
+    print(f"Video FPS: {fps:.2f}, Total Frames: {int(total_frames)}, Duration: {duration:.2f} seconds")
+
     frames = []
 
-    # Load video frames
+    # Define transforms dynamically based on target_size
+    base_transforms = [T.ToTensor()]
+    if target_size is not None:
+        base_transforms.append(T.Resize((target_size, target_size)))
+
+    unnormalized_transform = T.Compose(base_transforms)
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (target_size, target_size))  # Resize to 448x448
-        frame = frame.astype('float32') / 255.0
-        frames.append(frame)
+        image = Image.fromarray(frame)
+
+        unnormalized_frame = unnormalized_transform(image)
+        h, w = (
+            unnormalized_frame.shape[1] - unnormalized_frame.shape[1] % patch_size,
+            unnormalized_frame.shape[2] - unnormalized_frame.shape[2] % patch_size,
+        )
+        unnormalized_frame = unnormalized_frame[:, :h, :w]
+        frames.append(unnormalized_frame)
 
     cap.release()
 
-    # Convert to tensor: (B, H, W, C) -> (B, C, H, W)
-    frames = np.stack(frames)
-    frames = torch.tensor(frames).permute(0, 3, 1, 2)  # (B, C, H, W)
+    unnormalized_video = torch.stack(frames)
+    normalized_video = T.Compose([T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))])(unnormalized_video.clone())
 
-    frames = frames[:7]
-    # Normalize
-    transform = tt.Compose([tt.Normalize(mean=0.5, std=0.2)])
-    input_tensor = transform(frames).to(device)
+    # print(f"Unnormalized video shape: {unnormalized_video.shape}")
+    # print(f"Normalized video shape: {normalized_video.shape}")
 
-    print(f"Preprocessed video tensor shape: {input_tensor.shape}")
-    return frames, input_tensor
+    return unnormalized_video.to(device), normalized_video.to(device), fps
+
+
 
 
 
@@ -60,9 +92,54 @@ def get_patch_embeddings(model, input_tensor):
     result = model.forward_features(input_tensor)  # Forward pass
 
     patch_embeddings = result['x_norm_patchtokens'].detach().cpu().numpy().reshape([input_tensor.shape[0], -1, model.embed_dim])
-    return patch_embeddings  # (B, patch_resolution, embedding_dim)
+    return patch_embeddings  # (B, patch_num, embedding_dim)
 
-# Step 4: Perform two-stage PCA
+    
+
+
+def attention_visualize(attentions: np.ndarray, height_in_patches: int, width_in_patches: int, patch_size: int) -> np.ndarray:
+    """
+    Visualizes attention maps as colorized frames using the inferno colormap and returns a NumPy array.
+
+    Args:
+    - attentions (np.ndarray): Attention array of shape (T, NH, H_p * W_p + 1, H_p * W_p + 1).
+    - height_in_patches (int): Number of patches in height.
+    - width_in_patches (int): Number of patches in width.
+    - patch_size (int): Size of each patch in pixels.
+
+    Returns:
+    - np.ndarray: Colorized attention maps of shape (T, H, W, 3).
+    """
+    T, NH = attentions.shape[:2]  # Video length, number of heads
+
+    # Extract the attention of the CLS token to all patch tokens
+    attentions = attentions[:, :, 0, 1:].reshape(T, NH, height_in_patches, width_in_patches)  # (T, NH, H_p, W_p)
+
+    # Upscale attention maps to original resolution using OpenCV
+    upscaled_attentions = np.array([
+        np.array([
+            cv2.resize(attentions[t, h], (width_in_patches * patch_size, height_in_patches * patch_size), interpolation=cv2.INTER_NEAREST)
+            for h in range(NH)
+        ])
+        for t in range(T)
+    ])  # Shape: (T, NH, H, W)
+
+    # Average over all heads
+    average_attention = np.mean(upscaled_attentions, axis=1)  # Shape: (T, H, W)
+
+    # Apply inferno colormap frame by frame
+    colorized_frames = np.array([
+        plt.cm.inferno(frame)[:, :, :3]  # (H, W, 3)
+        for frame in average_attention
+    ])  # Shape: (T, H, W, 3)
+
+    return colorized_frames
+
+
+
+
+    
+    
 def two_stage_pca(patch_embeddings, threshold=0.6):
     """
     Perform two-stage PCA on patch embeddings:
@@ -70,30 +147,30 @@ def two_stage_pca(patch_embeddings, threshold=0.6):
     2. Second PCA with 3 components to reduce foreground patches to RGB-like embeddings.
 
     Args:
-    - patch_embeddings (np.ndarray): Patch embeddings of shape (B, patch_resolution, embedding_dim)
+    - patch_embeddings (np.ndarray): Patch embeddings of shape (B, num_patches_all_images, embedding_dim)
     - threshold (float): Threshold for selecting foreground patches after the first PCA.
 
     Returns:
-    - reduced_fg_patch_embeddings (np.ndarray): PCA-reduced foreground patch embeddings of shape (total_foreground_patches, 3)
-    - nums_of_fg_patches (list): Number of foreground patches for each image.
-    - masks
-    - reduced_patch_embeddings
+    - reduced_patch_embeddings (np.ndarray): PCA-reduced patch embeddings of shape (B, num_patches)
+    - reduced_fg_patch_embeddings (np.ndarray): PCA-reduced foreground patch embeddings of shape (num_fg_patches_all_images, 3)
+    - num_fg_patches_list (list): List of numbers of foreground patches for each image.
+    - masks (list): List of masks for each image
     """
-    B, patch_resolution, embedding_dim = patch_embeddings.shape
+    B, num_patches, embedding_dim = patch_embeddings.shape
 
     # First PCA: Extract foreground patches
     fg_pca = PCA(n_components=1)
-    all_patch_embeddings = patch_embeddings.reshape(-1, embedding_dim)  # (B*patch_resolution, embedding_dim)
-    reduced_patch_embeddings = fg_pca.fit_transform(all_patch_embeddings)  # (B*patch_resolution, 1)
+    all_patch_embeddings = patch_embeddings.reshape(-1, embedding_dim)  # (B*num_patches, embedding_dim)
+    reduced_patch_embeddings = fg_pca.fit_transform(all_patch_embeddings)  # (B*num_patches, 1)
     reduced_patch_embeddings = minmax_scale(reduced_patch_embeddings)  # Scale to (0,1)
-    reduced_patch_embeddings = reduced_patch_embeddings.reshape((B, patch_resolution))  # (B, patch_resolution)
+    reduced_patch_embeddings = reduced_patch_embeddings.reshape((B, num_patches))  # (B, num_patches)
 
     masks = []
     for i in range(B):
         mask = (reduced_patch_embeddings[i] > threshold).ravel()  # Foreground mask
         masks.append(mask)
 
-    nums_of_fg_patches = [np.sum(m) for m in masks]
+    num_fg_patches_list = [np.sum(m) for m in masks]
     fg_patch_embeddings = np.vstack([patch_embeddings[i, m, :] for i, m in enumerate(masks)])  # (total_fg_patches, embedding_dim)
 
     # Second PCA: Reduce foreground patches to 3 dimensions
@@ -101,15 +178,16 @@ def two_stage_pca(patch_embeddings, threshold=0.6):
     reduced_fg_patch_embeddings = object_pca.fit_transform(fg_patch_embeddings)  # (total_foreground_patches, 3)
     reduced_fg_patch_embeddings = minmax_scale(reduced_fg_patch_embeddings)  # Scale to (0,1)
 
-    for i, num_patches in enumerate(nums_of_fg_patches):
+    for i, num_patches in enumerate(num_fg_patches_list):
         print(f"Num of foreground patches of image {i}: {num_patches}")
 
-    total_foreground_patches = sum(nums_of_fg_patches)
-    print(f"Total num of foreground patches: {total_foreground_patches}")
-    
+    num_fg_patches_all_images = sum(num_fg_patches_list)
+    print(f"Total num of foreground patches: {num_fg_patches_all_images}")
+        
     print("Explained variance ratio by PCA components:", object_pca.explained_variance_ratio_)
+        
 
-    return reduced_fg_patch_embeddings, nums_of_fg_patches, masks, reduced_patch_embeddings
+    return reduced_patch_embeddings, reduced_fg_patch_embeddings, num_fg_patches_list, masks
 
 def print_video_model_stats(input_tensor, model):
     """
@@ -128,75 +206,83 @@ def print_video_model_stats(input_tensor, model):
     embedding_dim = model.embed_dim  # Embedding dimension from DINO
     print(f"Embedding dimension: {embedding_dim}")
 
-    patch_resolution = (H // patch_size) * (W // patch_size)  # Total number of patches per image
-    print(f"Number of patches of each image: {patch_resolution}")
+    patch_num = (H // patch_size) * (W // patch_size)  # Total number of patches per image
+    print(f"Number of patches of each image: {patch_num}")
+    
+    return B, C, H, W, patch_size, embedding_dim, patch_num
     
 
 
 
-
-
-def save_tensor_as_video(input_tensor, output_path='tensor_video.mp4', fps=30):
+def save_np_array_as_video(input_array: np.ndarray, output_path='array_video.mp4', fps: float = 30.0):
     """
-    Saves a PyTorch tensor (B, C, H, W) as an MP4 video.
+    Saves a NumPy array (T, H, W, C) as an MP4 video.
 
     Args:
-    - input_tensor (torch.Tensor): Video tensor with shape (B, C, H, W).
+    - input_array (np.ndarray): Video array with shape (T, H, W, C) in RGB format.
     - output_path (str): Path to save the output video.
-    - fps (int): Frames per second for the output video.
+    - fps (float): Frames per second for the output video.
     """
-    B, C, H, W = input_tensor.shape
+    T, H, W, C = input_array.shape
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+    out = cv2.VideoWriter(output_path, fourcc, fps, (W, H))  # ✅ Fix width-height order
 
-    for i in range(B):
-        frame = (input_tensor[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    for i in range(T):
+        frame = input_array[i]
+
+        # ✅ Scale only if float in range [0,1]
+        if np.issubdtype(frame.dtype, np.floating) and frame.min() >= 0 and frame.max() <= 1:
+            frame = (frame * 255).astype(np.uint8)
+
+        # Convert RGB to BGR for OpenCV
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        out.write(frame_bgr)
 
     out.release()
     print(f"Video saved to {output_path}")
 
 
-def save_triple_video(input_tensor, reduced_fg_patch_embeddings, nums_of_fg_patches, masks, reduced_patch_embeddings, patch_resolution, patch_size, output_path='triple_video.mp4', fps=30):
+
+
+def save_triple_video(input_tensor, reduced_patch_embeddings, reduced_fg_patch_embeddings, nums_of_fg_patches, masks,  # In the `save_triple_video` function, the `num_patches` variable is used to store the total number of patches in each frame of the video. This value is calculated based on the dimensions of the input frames and the patch size used in the model.
+num_patches, patch_size, output_path='triple_video.mp4', fps: float = 30.0):
     """
     Saves an MP4 video with three sections:
     - Left: Original frames
-    - Middle: Foreground mask from the first PCA component
-    - Right: PCA-based foreground patches
+    - Middle: Foreground mask from the first PCA component (B, num_patches)
+    - Right: PCA-based foreground patches (B, num_fg_patches, 3)
     
     Args:
     - input_tensor (torch.Tensor): Original video tensor (B, C, H, W).
-    - reduced_fg_patch_embeddings (np.ndarray): PCA-reduced foreground patch embeddings (N, 3).
+    - reduced_patch_embeddings (np.ndarray): PCA first component embeddings for foreground mask (B, num_patches).
+    - reduced_fg_patch_embeddings (np.ndarray): PCA-reduced foreground patch embeddings (total_foreground_patches, 3).
     - nums_of_fg_patches (list): Number of foreground patches for each frame.
     - masks (list): Boolean masks for foreground patches for each frame.
-    - reduced_patch_embeddings (np.ndarray): PCA first component embeddings for foreground mask.
-    - patch_resolution (int): Total number of patches in each frame.
+    - num_patches (int): Number of patches in each frame.
     - patch_size (int): Patch size used in the model.
     - output_path (str): Output path for the video.
     - fps (int): Frames per second for the video.
     """
     B, C, H, W = input_tensor.shape
     start_idx = 0
-
-    # Video writer with triple width
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (3 * W, H))  # 3W width for triple view
+    frames_list = []
 
     for i, mask in enumerate(masks):
-        num_patches = nums_of_fg_patches[i]
+        num_fg_patches = nums_of_fg_patches[i]
         
         # ======== PCA Foreground Patches (Right) ========
-        patch_image = np.zeros((patch_resolution, 3), dtype='float32')# The background will be value=0 (black in RGB)
-        patch_image[mask, :] = reduced_fg_patch_embeddings[start_idx:start_idx + num_patches, :]
-        start_idx += num_patches
+        patch_image = np.zeros((num_patches, 3), dtype='float32')  # Black background
+        patch_image[mask, :] = reduced_fg_patch_embeddings[start_idx:start_idx + num_fg_patches, :]
+        start_idx += num_fg_patches
         color_patches = patch_image.reshape((H // patch_size, W // patch_size, 3))
-        pca_frame = cv2.resize((color_patches * 255).astype(np.uint8), (H, W))
+        pca_frame = cv2.resize((color_patches * 255).astype(np.uint8), (W, H))
 
         # ======== Foreground Mask (Middle) ========
-        mask_image = np.zeros((patch_resolution,), dtype='float32')
-        mask_image[mask] = reduced_patch_embeddings[i][mask]  # Use the first PCA component
+        mask_image = np.zeros((num_patches,), dtype='float32')
+        mask_image[mask] = reduced_patch_embeddings[i][mask]
         mask_image = mask_image.reshape((H // patch_size, W // patch_size))
-        mask_frame = cv2.resize((mask_image * 255).astype(np.uint8), (H, W))
+        mask_frame = cv2.resize((mask_image * 255).astype(np.uint8), (W, H))
         mask_frame = cv2.cvtColor(mask_frame, cv2.COLOR_GRAY2BGR)
 
         # ======== Original Frame (Left) ========
@@ -204,9 +290,7 @@ def save_triple_video(input_tensor, reduced_fg_patch_embeddings, nums_of_fg_patc
 
         # ======== Combine Frames Horizontally ========
         combined_frame = np.hstack((original_frame, mask_frame, pca_frame))
+        frames_list.append(combined_frame)
 
-        # Write the combined frame to the video file
-        out.write(cv2.cvtColor(combined_frame, cv2.COLOR_RGB2BGR))
-
-    out.release()
-    print(f"Triple video saved to {output_path}")
+    frames_array = np.stack(frames_list)  # Shape: (B, H, W, 3)
+    save_np_array_as_video(frames_array, output_path=output_path, fps=fps)

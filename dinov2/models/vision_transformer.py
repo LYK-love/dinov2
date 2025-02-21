@@ -268,6 +268,20 @@ class DinoVisionTransformer(nn.Module):
             "x_prenorm": x,
             "masks": masks,
         }
+        
+    def get_last_selfattention(self, x, masks=None):
+        if isinstance(x, list):
+            return self.forward_features_list(x, masks)
+        
+        x = self.prepare_tokens_with_masks(x, masks)
+    
+        # Run through model, at the last block just return the attention.
+        for i, blk in enumerate(self.blocks):
+            if i < len(self.blocks) - 1:
+                x = blk(x)
+            else: 
+                return blk(x, return_attention=True)
+
 
     def _get_intermediate_layers_not_chunked(self, x, n=1):
         x = self.prepare_tokens_with_masks(x)

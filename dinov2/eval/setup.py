@@ -62,6 +62,10 @@ def get_autocast_dtype(config):
 def build_model_for_eval(config, pretrained_weights):
     model, _ = build_model_from_cfg(config, only_teacher=True)
     dinov2_utils.load_pretrained_weights(model, pretrained_weights, "teacher")
+    
+    for p in model.parameters():
+        p.requires_grad = False
+        
     model.eval()
     model.cuda()
     return model
