@@ -76,7 +76,7 @@ def load_preprocess_video(video_path, target_size=None, patch_size=14, device='c
 
     cap.release()
 
-    unnormalized_video = torch.stack(frames)
+    unnormalized_video = torch.stack(frames[:])
     normalized_video = T.Compose([T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))])(unnormalized_video.clone())
 
     # print(f"Unnormalized video shape: {unnormalized_video.shape}")
@@ -97,12 +97,12 @@ def get_patch_embeddings(model, input_tensor):
     
 
 
-def attention_visualize(attentions: np.ndarray, height_in_patches: int, width_in_patches: int, patch_size: int) -> np.ndarray:
+def attention_visualize(attentions: np.ndarray, height_in_patches: int, width_in_patches: int, patch_size: int, num_register_tokens: int = 0) -> np.ndarray:
     """
     Visualizes attention maps as colorized frames using the inferno colormap and returns a NumPy array.
 
     Args:
-    - attentions (np.ndarray): Attention array of shape (T, NH, H_p * W_p + 1, H_p * W_p + 1).
+    - attentions (np.ndarray): Attention array of shape (T, NH, H_p + num_register_tokens +  1, W_p + num_register_tokens + 1).
     - height_in_patches (int): Number of patches in height.
     - width_in_patches (int): Number of patches in width.
     - patch_size (int): Size of each patch in pixels.
@@ -113,7 +113,7 @@ def attention_visualize(attentions: np.ndarray, height_in_patches: int, width_in
     T, NH = attentions.shape[:2]  # Video length, number of heads
 
     # Extract the attention of the CLS token to all patch tokens
-    attentions = attentions[:, :, 0, 1:].reshape(T, NH, height_in_patches, width_in_patches)  # (T, NH, H_p, W_p)
+    attentions = attentions[:, :, 0, num_register_tokens + 1:].reshape(T, NH, height_in_patches, width_in_patches)  # (T, NH, H_p, W_p)
 
     # Upscale attention maps to original resolution using OpenCV
     upscaled_attentions = np.array([
@@ -127,6 +127,11 @@ def attention_visualize(attentions: np.ndarray, height_in_patches: int, width_in
     # Average over all heads
     average_attention = np.mean(upscaled_attentions, axis=1)  # Shape: (T, H, W)
 
+    # It's necessary to normalize the attention maps to [0, 1] for colorization
+    min_val, max_val = average_attention.min(), average_attention.max()
+    if max_val > min_val:  # Avoid division by zero
+        average_attention = (average_attention - min_val) / (max_val - min_val)
+        
     # Apply inferno colormap frame by frame
     colorized_frames = np.array([
         plt.cm.inferno(frame)[:, :, :3]  # (H, W, 3)
@@ -245,24 +250,31 @@ def save_np_array_as_video(input_array: np.ndarray, output_path='array_video.mp4
 
 
 
-def save_triple_video(input_tensor, reduced_patch_embeddings, reduced_fg_patch_embeddings, nums_of_fg_patches, masks,  # In the `save_triple_video` function, the `num_patches` variable is used to store the total number of patches in each frame of the video. This value is calculated based on the dimensions of the input frames and the patch size used in the model.
-num_patches, patch_size, output_path='triple_video.mp4', fps: float = 30.0):
+def normalize_frame(frame: np.ndarray) -> np.ndarray:
+    """Normalize a NumPy array frame to the range [0, 255] if it contains float values."""
+    if frame.dtype == np.float32 or frame.dtype == np.float64:
+        min_val, max_val = frame.min(), frame.max()
+        if max_val > min_val:  # Avoid division by zero
+            frame = (frame - min_val) / (max_val - min_val) * 255
+        frame = frame.astype(np.uint8)
+    return frame
+
+def save_triple_video(
+    input_tensor: torch.Tensor,
+    reduced_patch_embeddings: np.ndarray,
+    reduced_fg_patch_embeddings: np.ndarray,
+    nums_of_fg_patches: list,
+    masks: list,
+    num_patches: int,
+    patch_size: int,
+    output_path='triple_video.mp4',
+    fps: float = 30.0
+):
     """
     Saves an MP4 video with three sections:
     - Left: Original frames
-    - Middle: Foreground mask from the first PCA component (B, num_patches)
+    - Middle: Foreground mask from PCA component (B, num_patches)
     - Right: PCA-based foreground patches (B, num_fg_patches, 3)
-    
-    Args:
-    - input_tensor (torch.Tensor): Original video tensor (B, C, H, W).
-    - reduced_patch_embeddings (np.ndarray): PCA first component embeddings for foreground mask (B, num_patches).
-    - reduced_fg_patch_embeddings (np.ndarray): PCA-reduced foreground patch embeddings (total_foreground_patches, 3).
-    - nums_of_fg_patches (list): Number of foreground patches for each frame.
-    - masks (list): Boolean masks for foreground patches for each frame.
-    - num_patches (int): Number of patches in each frame.
-    - patch_size (int): Patch size used in the model.
-    - output_path (str): Output path for the video.
-    - fps (int): Frames per second for the video.
     """
     B, C, H, W = input_tensor.shape
     start_idx = 0
@@ -270,27 +282,31 @@ num_patches, patch_size, output_path='triple_video.mp4', fps: float = 30.0):
 
     for i, mask in enumerate(masks):
         num_fg_patches = nums_of_fg_patches[i]
-        
+
         # ======== PCA Foreground Patches (Right) ========
         patch_image = np.zeros((num_patches, 3), dtype='float32')  # Black background
         patch_image[mask, :] = reduced_fg_patch_embeddings[start_idx:start_idx + num_fg_patches, :]
         start_idx += num_fg_patches
         color_patches = patch_image.reshape((H // patch_size, W // patch_size, 3))
-        pca_frame = cv2.resize((color_patches * 255).astype(np.uint8), (W, H))
+        pca_frame = cv2.resize(color_patches, (W, H))  # Keep float values for normalization
+        pca_frame = normalize_frame(pca_frame)  # Normalize separately
 
         # ======== Foreground Mask (Middle) ========
         mask_image = np.zeros((num_patches,), dtype='float32')
         mask_image[mask] = reduced_patch_embeddings[i][mask]
         mask_image = mask_image.reshape((H // patch_size, W // patch_size))
-        mask_frame = cv2.resize((mask_image * 255).astype(np.uint8), (W, H))
-        mask_frame = cv2.cvtColor(mask_frame, cv2.COLOR_GRAY2BGR)
+        mask_frame = cv2.resize(mask_image, (W, H))  # Keep float values for normalization
+        mask_frame = normalize_frame(mask_frame)  # Normalize separately
+        mask_frame = cv2.cvtColor(mask_frame, cv2.COLOR_GRAY2BGR)  # Convert to 3-channel
 
         # ======== Original Frame (Left) ========
-        original_frame = (input_tensor[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-
+        original_frame = (input_tensor[i].permute(1, 2, 0).cpu().numpy())
+        original_frame = normalize_frame(original_frame)
+        
         # ======== Combine Frames Horizontally ========
         combined_frame = np.hstack((original_frame, mask_frame, pca_frame))
         frames_list.append(combined_frame)
 
     frames_array = np.stack(frames_list)  # Shape: (B, H, W, 3)
+    
     save_np_array_as_video(frames_array, output_path=output_path, fps=fps)
