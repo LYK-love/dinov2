@@ -12,17 +12,6 @@ import torch.nn as nn
 import torchvision.transforms as T
 from PIL import Image
 
-import cv2
-import torch
-import torchvision.transforms as T
-from PIL import Image
-
-
-import cv2
-import torch
-import torchvision.transforms as T
-from PIL import Image
-
 
 def load_preprocess_video(video_path, target_size=None, patch_size=14, device='cuda'):
     """
