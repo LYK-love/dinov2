@@ -187,5 +187,4 @@ cython_debug/
 
 
 dinov2/checkpoints
-notebooks/data/videos
-notebooks/data/outputs
+notebooks/data/

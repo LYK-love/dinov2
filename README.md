@@ -1,8 +1,12 @@
 :new: [2023-10-26] *Added DINOv2 backbones with registers, following [Vision Transformers Need Registers](https://arxiv.org/abs/2309.16588).*
 
 
+Installation:
+
+Install [conda](https://www.anaconda.com/docs/getting-started/miniconda/install#linux) first 
 ```sh
 conda create --name dinov2 python=3.9 --yes
+conda activate dinov2
 pip install -r requirements.txt 
 pip install -r requirements-extras.txt 
 
