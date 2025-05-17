@@ -14,6 +14,12 @@ import torchvision.transforms as T
 from PIL import Image
 
 
+def min_max_normalize(attention_map):
+    att_min = attention_map.min()
+    att_max = attention_map.max()
+    return (attention_map - att_min) / (att_max - att_min + 1e-8)  # Adding epsilon for numerical stability
+
+
 def load_and_preprocess_video(
     video_path: str,
     target_size: Optional[int] = None,
@@ -63,7 +69,7 @@ def load_and_preprocess_video(
     cap.release()
 
     # Convert to tensor [T, H, W, C]
-    raw_video = torch.tensor(raw_frames, dtype=torch.float32) / 255.0
+    raw_video = torch.tensor(np.array(raw_frames), dtype=torch.float32) / 255.0
     # Permute to [T, C, H, W] format expected by PyTorch
     raw_video = raw_video.permute(0, 3, 1, 2)
 
@@ -97,7 +103,7 @@ def load_and_preprocess_video(
     return unnormalized_video.to(device), normalized_video.to(device), fps
 
 
-def get_model_output(model, input_tensor):
+def get_model_output(model, input_tensor: torch.Tensor):
     """
     Extracts the class token embedding and patch token embeddings from the model's output.
     Args:
@@ -169,59 +175,104 @@ def get_patch_embeddings(model, input_tensor):
     return patch_embeddings  # (B, patch_num, embedding_dim)
 
 
-def attention_visualize(
-    attentions: np.ndarray, height_in_patches: int, width_in_patches: int, patch_size: int, num_register_tokens: int = 0
+def get_attention_map(
+    attn_weights: np.ndarray,
+    height_in_patches: int,
+    width_in_patches: int,
+    num_register_tokens: int = 0,
 ) -> np.ndarray:
     """
-    Visualizes attention maps as colorized frames using the inferno colormap and returns a NumPy array.
+    Extract an attention mapfrom attention weights of shape (T, NH, H_p + num_register_tokens +  1, W_p + num_register_tokens + 1).
 
     Args:
     - attentions (np.ndarray): Attention array of shape (T, NH, H_p + num_register_tokens +  1, W_p + num_register_tokens + 1).
     - height_in_patches (int): Number of patches in height.
     - width_in_patches (int): Number of patches in width.
+    = num_register_tokens (int): Number of register tokens.
+
+    Returns:
+    - np.ndarray: normalized attention map of shape (T, H_p, W_p), range [0, 1].
+    """
+    T, NH = attn_weights.shape[:2]  # Video length, number of heads
+
+    # Extract the attention of the CLS token to all patch tokens, getting H_p * W_p attention weights, then reshape it into a map
+    attn_weights = attn_weights[:, :, 0, num_register_tokens + 1 :].reshape(
+        T, NH, height_in_patches, width_in_patches
+    )  # (T, NH, H_p, W_p)
+
+    # Average over all heads
+    average_attention = np.mean(attn_weights, axis=1)  # Shape: (T, H_p, W_p)
+    normalized_map = min_max_normalize(average_attention)  # Normalize to [0, 1]
+    return normalized_map  # This is the attention map
+
+
+def colorize_attention_map(
+    attention_map: np.ndarray,
+    patch_size: int,
+) -> np.ndarray:
+    """
+    Visualizes attention maps as colorized frames using the inferno colormap and returns a NumPy array.
+
+    Args:
+    - attentions (np.ndarray): Attention map of shape (T, H_p, W_p), range [0, 1].
     - patch_size (int): Size of each patch in pixels.
 
     Returns:
     - np.ndarray: Colorized attention maps of shape (T, H, W, 3).
     """
-    T, NH = attentions.shape[:2]  # Video length, number of heads
-
-    # Extract the attention of the CLS token to all patch tokens
-    attentions = attentions[:, :, 0, num_register_tokens + 1 :].reshape(
-        T, NH, height_in_patches, width_in_patches
-    )  # (T, NH, H_p, W_p)
+    T, H_p, W_p = attention_map.shape[:3]
 
     # Upscale attention maps to original resolution using OpenCV
     upscaled_attentions = np.array(
         [
-            np.array(
-                [
-                    cv2.resize(
-                        attentions[t, h],
-                        (width_in_patches * patch_size, height_in_patches * patch_size),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                    for h in range(NH)
-                ]
+            cv2.resize(
+                attention_map[t],
+                (H_p * patch_size, W_p * patch_size),
+                interpolation=cv2.INTER_NEAREST,
             )
             for t in range(T)
         ]
-    )  # Shape: (T, NH, H, W)
-
-    # Average over all heads
-    average_attention = np.mean(upscaled_attentions, axis=1)  # Shape: (T, H, W)
-
-    # It's necessary to normalize the attention maps to [0, 1] for colorization
-    min_val, max_val = average_attention.min(), average_attention.max()
-    if max_val > min_val:  # Avoid division by zero
-        average_attention = (average_attention - min_val) / (max_val - min_val)
+    )  # Shape: (T, H, W)
 
     # Apply inferno colormap frame by frame
     colorized_frames = np.array(
-        [plt.cm.inferno(frame)[:, :, :3] for frame in average_attention]  # (H, W, 3)
+        [
+            plt.cm.inferno(frame)[:, :, :3] for frame in upscaled_attentions
+        ]  # each frame  is of shape (H, W), we colorize it to (H, W, 3)
     )  # Shape: (T, H, W, 3)
 
     return colorized_frames
+
+
+def find_percentile_threshold(attn_map, percentile=80):
+    """
+    Determine threshold based on a percentile of attention values.
+    Higher percentile = more focused/selective mask.
+    """
+    return np.percentile(attn_map, percentile)  # top 20% > threshold >= bottom 80%
+
+
+def generate_attention_mask(normalized_attn_map: np.ndarray, threshold: float = 0.72) -> np.ndarray:
+    """
+    Generate a binary mask from a normalized attention map using a threshold.
+
+    Args:
+        normalized_attn_map (np.ndarray): Normalized attention map of shape (T, H_p, W_p)
+                                         with values in range [0, 1].
+        threshold (float): Threshold value between 0 and 1. Attention values greater than
+                          or equal to this threshold will be set to 1, otherwise 0.
+
+    Returns:
+        np.ndarray: Binary mask of shape (T, H_p, W_p) with values {0, 1}.
+    """
+    # Ensure the threshold is in valid range
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError(f"Threshold must be between 0 and 1, got {threshold}")
+
+    # Apply threshold to create binary mask
+    binary_mask = (normalized_attn_map >= threshold).astype(np.uint8)
+
+    return binary_mask
 
 
 def two_stage_pca(patch_embeddings, threshold=0.6):
@@ -492,6 +543,36 @@ def compute_cosine_similarity(emb1, emb2):
     return similarity.tolist()
 
 
+def get_last_self_attn(model: torch.nn.Module, video: torch.Tensor):
+    """
+    Get the last self-attention weights from the model for a given video tensor. We collect attention weights for each frame iteratively and stack them.
+    This solution saves VRAM but not forward all frames at once. But it should be OKay as DINOv2 doesn't integrate the time dimension processing.
+
+    Parameters:
+        model (torch.nn.Module): The model from which to extract the last self-attention weights.
+        video (torch.Tensor): Input video tensor with shape (T, C, H, W).
+
+    Returns:
+        np.ndarray: Last self-attention weights of shape (T, NH, H_p + num_register_tokens +  1, W_p + num_register_tokens + 1).
+    """
+    from tqdm import tqdm
+
+    T, C, H, W = video.shape
+    last_selfattention_list = []
+    with torch.no_grad():
+        for i in tqdm(range(T)):
+            frame = video[i].unsqueeze(0)  # Add batch dimension for the model
+
+            # Forward pass for the single frame
+            last_selfattention = model.get_last_selfattention(frame).detach().cpu().numpy()
+
+            last_selfattention_list.append(last_selfattention)
+
+    return np.vstack(
+        last_selfattention_list
+    )  # (B, num_heads, num_tokens, num_tokens), where num_tokens = H_p + num_register_tokens + 1
+
+
 def plot_videos(video1: np.ndarray, video2: np.ndarray, distances: list, output_path=None, fps=10):
     """
     Creates an animation of two videos side by side with their frame-by-frame distances.
@@ -654,3 +735,17 @@ def colorize_area(video: torch.Tensor, color: list, starting_location: tuple, wi
         colorized_video[:, :, y : y + height, x : x + width] = colored
 
     return colorized_video
+
+
+def image_tensor_to_np(image_tensor: torch.Tensor) -> np.ndarray:
+    """
+    Convert a PyTorch tensor to a NumPy array.
+
+    Args:
+        image_tensor (torch.Tensor): Input tensor with shape (T, C, H, W).
+
+    Returns:
+        np.ndarray: Converted NumPy array with shape (T, H, W, C).
+    """
+    T, C, H, W = image_tensor.shape
+    return image_tensor.permute(0, 2, 3, 1).detach().cpu().numpy()
