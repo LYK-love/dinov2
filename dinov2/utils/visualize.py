@@ -120,6 +120,35 @@ def get_model_output(model, input_tensor: torch.Tensor):
     return cls_token_embedding, patch_token_embeddings
 
 
+def get_model_output_vram_efficient(model, video: torch.Tensor):
+    """
+    Extracts the class token embedding and patch token embeddings from the model's output.
+    Args:
+        model: The model object that contains the `forward_features` method.
+        input_tensor: A tensor representing the input data to the model.
+    Returns:
+        tuple: A tuple containing:
+            - cls_token_embedding (numpy.ndarray): The class token embedding extracted from the model's output.
+            - patch_token_embeddings (numpy.ndarray): The patch token embeddings extracted from the model's output.
+    """
+
+    from tqdm import tqdm
+
+    cls_token_embedding_list = []
+    patch_token_embeddings_list = []
+
+    with torch.no_grad():
+        for i in tqdm(range(T)):
+            frame = video[i].unsqueeze(0)  # Add batch dimension for the model
+
+            result = model.forward_features(frame)  # Forward pass
+            cls_token_embedding_list.append(result["x_norm_clstoken"].detach().cpu().numpy())
+            patch_token_embeddings_list.append(result["x_norm_patchtokens"].detach().cpu().numpy())
+    cls_token_embedding = np.vstack(cls_token_embedding_list)  # (B, embedding_dim)
+    patch_token_embeddings = np.vstack(patch_token_embeddings_list)  # (B, num_patches, embedding_dim)
+    return cls_token_embedding, patch_token_embeddings
+
+
 def get_cls_token_embeddings(model, input_tensor):
     """
     Extracts CLS token embeddings from the given model and input tensor.
@@ -278,7 +307,7 @@ def generate_attention_mask(normalized_attn_map: np.ndarray, threshold: float = 
 def two_stage_pca(patch_embeddings, threshold=0.6):
     """
     Perform two-stage PCA on patch embeddings:
-    1. First PCA with 1 component to extract foreground patches.
+    1. First PCA with 1 component to extract foreground patches (>= threshold).
     2. Second PCA with 3 components to reduce foreground patches to RGB-like embeddings.
 
     This computation doesn NOT involve GPU, so all the params are np arrays.
